@@ -6,22 +6,28 @@
 
 #include "frontend/Frontend2.h"
 
-#include "mozilla/Span.h"  // mozilla::{Span, MakeSpan}
+#include "mozilla/Maybe.h"                  // mozilla::Maybe
+#include "mozilla/OperatorNewExtensions.h"  // mozilla::KnownNotNull
+#include "mozilla/Span.h"                   // mozilla::{Span, MakeSpan}
 
 #include <stddef.h>  // size_t
 #include <stdint.h>  // uint8_t, uint32_t
 
 #include "jsapi.h"
 
+#include "frontend/AbstractScope.h"    // ScopeIndex
 #include "frontend/CompilationInfo.h"  // CompilationInfo
 #include "frontend/smoosh_generated.h"  // CVec, SmooshResult, SmooshCompileOptions, free_smoosh, run_smoosh
 #include "frontend/SourceNotes.h"  // jssrcnote
+#include "frontend/Stencil.h"      // ScopeCreationData
 #include "gc/Rooting.h"            // RootedScriptSourceObject
 #include "js/HeapAPI.h"            // JS::GCCellPtr
-#include "js/RootingAPI.h"         // JS::Handle
+#include "js/RootingAPI.h"         // JS::Handle, JS::Rooted
 #include "js/TypeDecls.h"          // Rooted{Script,Value,String,Object}
 #include "vm/JSAtom.h"             // AtomizeUTF8Chars
-#include "vm/JSScript.h"           // JSScript
+#include "vm/JSScript.h"           // JSScript, ScopeNote
+#include "vm/Scope.h"              // BindingName
+#include "vm/ScopeKind.h"          // ScopeKind
 
 #include "vm/JSContext-inl.h"  // AutoKeepAtoms (used by BytecodeCompiler)
 
@@ -37,17 +43,19 @@ namespace frontend {
 
 class SmooshScriptStencil : public ScriptStencil {
   const SmooshResult& result_;
+  CompilationInfo& compilationInfo_;
+  JSAtom** allAtoms_ = nullptr;
 
   void init() {
     lineno = result_.lineno;
     column = result_.column;
 
-    natoms = result_.strings.len;
+    natoms = result_.atoms.len;
 
-    ngcthings = 1;
+    ngcthings = result_.gcthings.len;
 
     numResumeOffsets = 0;
-    numScopeNotes = 0;
+    numScopeNotes = result_.scope_notes.len;
     numTryNotes = 0;
 
     mainOffset = result_.main_offset;
@@ -73,37 +81,155 @@ class SmooshScriptStencil : public ScriptStencil {
   }
 
  public:
-  explicit SmooshScriptStencil(const SmooshResult& result) : result_(result) {
+  explicit SmooshScriptStencil(const SmooshResult& result,
+                               CompilationInfo& compilationInfo)
+      : result_(result), compilationInfo_(compilationInfo) {
     init();
   }
 
   virtual bool finishGCThings(JSContext* cx,
                               mozilla::Span<JS::GCCellPtr> gcthings) const {
-    gcthings[0] = JS::GCCellPtr(&cx->global()->emptyGlobalScope());
-    return true;
-  }
+    for (size_t i = 0; i < ngcthings; i++) {
+      SmooshGCThing& item = result_.gcthings.data[i];
 
-  virtual bool initAtomMap(JSContext* cx, GCPtrAtom* atoms) const {
-    for (uint32_t i = 0; i < natoms; i++) {
-      const CVec<uint8_t>& string = result_.strings.data[i];
-      JSAtom* atom = AtomizeUTF8Chars(cx, (const char*)string.data, string.len);
-      if (!atom) {
-        return false;
+      switch (item.kind) {
+        case SmooshGCThingKind::ScopeIndex: {
+          MutableHandle<ScopeCreationData> data =
+              compilationInfo_.scopeCreationData[item.scope_index];
+          Scope* scope = data.get().createScope(cx);
+          if (!scope) {
+            return false;
+          }
+
+          gcthings[i] = JS::GCCellPtr(scope);
+
+          break;
+        }
       }
-      atoms[i] = atom;
     }
 
     return true;
   }
 
+  virtual void initAtomMap(GCPtrAtom* atoms) const {
+    for (uint32_t i = 0; i < natoms; i++) {
+      size_t index = result_.atoms.data[i];
+      atoms[i] = allAtoms_[index];
+    }
+  }
+
   virtual void finishResumeOffsets(
       mozilla::Span<uint32_t> resumeOffsets) const {}
 
-  virtual void finishScopeNotes(mozilla::Span<ScopeNote> scopeNotes) const {}
+  virtual void finishScopeNotes(mozilla::Span<ScopeNote> scopeNotes) const {
+    for (size_t i = 0; i < result_.scope_notes.len; i++) {
+      SmooshScopeNote& scopeNote = result_.scope_notes.data[i];
+      scopeNotes[i].index = scopeNote.index;
+      scopeNotes[i].start = scopeNote.start;
+      scopeNotes[i].length = scopeNote.length;
+      scopeNotes[i].parent = scopeNote.parent;
+    }
+  }
 
   virtual void finishTryNotes(mozilla::Span<JSTryNote> tryNotes) const {}
 
   virtual void finishInnerFunctions() const {}
+
+  bool createAtoms(JSContext* cx) {
+    size_t numAtoms = result_.all_atoms.len;
+
+    auto& alloc = compilationInfo_.allocScope.alloc();
+
+    allAtoms_ = alloc.newArray<JSAtom*>(numAtoms);
+    if (!allAtoms_) {
+      ReportOutOfMemory(cx);
+      return false;
+    }
+
+    for (size_t i = 0; i < numAtoms; i++) {
+      const CVec<uint8_t>& string = result_.all_atoms.data[i];
+      JSAtom* atom = AtomizeUTF8Chars(cx, (const char*)string.data, string.len);
+      if (!atom) {
+        return false;
+      }
+      allAtoms_[i] = atom;
+    }
+
+    return true;
+  }
+
+  bool createScopeCreationgData(JSContext* cx) {
+    auto& alloc = compilationInfo_.allocScope.alloc();
+
+    for (size_t i = 0; i < result_.scopes.len; i++) {
+      SmooshScopeData& scopeData = result_.scopes.data[i];
+      size_t numBindings = scopeData.bindings.len;
+      ScopeIndex index;
+
+      switch (scopeData.kind) {
+        case SmooshScopeDataKind::Global: {
+          JS::Rooted<GlobalScope::Data*> data(
+              cx, NewEmptyBindingData<GlobalScope>(cx, alloc, numBindings));
+          if (!data) {
+            return false;
+          }
+
+          BindingName* names = data->trailingNames.start();
+          for (size_t i = 0; i < numBindings; i++) {
+            SmooshBindingName& name = scopeData.bindings.data[i];
+            new (mozilla::KnownNotNull, &names[i])
+                BindingName(allAtoms_[name.name], name.is_closed_over,
+                            name.is_top_level_function);
+          }
+
+          data->letStart = scopeData.let_start;
+          data->constStart = scopeData.const_start;
+          data->length = numBindings;
+
+          if (!ScopeCreationData::create(cx, compilationInfo_,
+                                         ScopeKind::Global, data, &index)) {
+            return false;
+          }
+          break;
+        }
+        case SmooshScopeDataKind::Lexical: {
+          JS::Rooted<LexicalScope::Data*> data(
+              cx, NewEmptyBindingData<LexicalScope>(cx, alloc, numBindings));
+          if (!data) {
+            return false;
+          }
+
+          BindingName* names = data->trailingNames.start();
+          for (size_t i = 0; i < numBindings; i++) {
+            SmooshBindingName& name = scopeData.bindings.data[i];
+            new (mozilla::KnownNotNull, &names[i])
+                BindingName(allAtoms_[name.name], name.is_closed_over,
+                            name.is_top_level_function);
+          }
+
+          // NOTE: data->nextFrameSlot is set in ScopeCreationData::create.
+
+          data->constStart = scopeData.const_start;
+          data->length = numBindings;
+
+          uint32_t firstFrameSlot = scopeData.first_frame_slot;
+          ScopeIndex enclosingIndex(scopeData.enclosing);
+          Rooted<AbstractScope> enclosing(
+              cx, AbstractScope(compilationInfo_, enclosingIndex));
+          if (!ScopeCreationData::create(cx, compilationInfo_,
+                                         ScopeKind::Lexical, data,
+                                         firstFrameSlot, enclosing, &index)) {
+            return false;
+          }
+          break;
+        }
+      }
+
+      MOZ_ASSERT(index == i);
+    }
+
+    return true;
+  }
 };
 
 // Free given SmooshResult on leaving scope.
@@ -184,7 +310,15 @@ JSScript* Smoosh::compileGlobalScript(CompilationInfo& compilationInfo,
   RootedScript script(cx, JSScript::Create(cx, cx->global(), options, sso, 0,
                                            length, 0, length, 1, 0));
 
-  SmooshScriptStencil stencil(smoosh);
+  SmooshScriptStencil stencil(smoosh, compilationInfo);
+  if (!stencil.createAtoms(cx)) {
+    return nullptr;
+  }
+
+  if (!stencil.createScopeCreationgData(cx)) {
+    return nullptr;
+  }
+
   if (!JSScript::fullyInitFromStencil(cx, script, stencil)) {
     return nullptr;
   }
